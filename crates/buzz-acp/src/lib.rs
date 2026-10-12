@@ -399,6 +399,7 @@ mod inbound_author_gate {
     async fn author_allowed(
         respond_to: &RespondTo,
         allowlist: &HashSet<String>,
+        strict_allowlist: bool,
         author: &str,
         channel_trust: ChannelTrust,
         owner_cache: &OwnerCache,
@@ -407,6 +408,9 @@ mod inbound_author_gate {
         match respond_to {
             RespondTo::Nobody => false,
             RespondTo::Anyone if matches!(channel_trust, ChannelTrust::Channel) => true,
+            RespondTo::Allowlist if strict_allowlist => {
+                !matches!(channel_trust, ChannelTrust::Unknown) && allowlist.contains(author)
+            }
             RespondTo::Allowlist
                 if !matches!(channel_trust, ChannelTrust::Unknown)
                     && allowlist.contains(author) =>
@@ -429,6 +433,7 @@ mod inbound_author_gate {
         author_allowed(
             respond_to,
             allowlist,
+            false,
             author,
             ChannelTrust::known(is_dm),
             owner_cache,
@@ -439,6 +444,7 @@ mod inbound_author_gate {
 
     pub(crate) struct InboundAuthorGate {
         agent_pubkey_hex: String,
+        strict_allowlist: bool,
         relay_self: Option<String>,
         // None means no authoritative NIP-11 result yet, including at startup.
         refreshed_generation: Option<u64>,
@@ -458,9 +464,15 @@ mod inbound_author_gate {
             let (relay_self, completed) = refresh_relay_self(rest_client, None, context).await;
             Self {
                 agent_pubkey_hex: agent_pubkey_hex.to_string(),
+                strict_allowlist: false,
                 relay_self,
                 refreshed_generation: completed.then_some(0),
             }
+        }
+
+        /// Apply the configured policy to both normal and setup listeners.
+        pub(crate) fn set_strict_allowlist(&mut self, strict_allowlist: bool) {
+            self.strict_allowlist = strict_allowlist;
         }
 
         /// Whether delegated workflow attribution is currently available.
@@ -542,6 +554,7 @@ mod inbound_author_gate {
             let allowed = author_allowed(
                 respond_to,
                 allowlist,
+                self.strict_allowlist,
                 &effective_author,
                 channel_trust,
                 owner_cache,
@@ -2729,6 +2742,7 @@ async fn run_harness(
     let relay_rest_client = relay.rest_client();
     let mut author_gate_ctx =
         InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
+    author_gate_ctx.set_strict_allowlist(config.strict_allowlist);
 
     relay
         .subscribe_membership_notifications()
@@ -3511,12 +3525,9 @@ async fn run_harness(
                             // agent. Must be AFTER !shutdown (owner can always
                             // shut down regardless of gate mode).
                             //
-                            // Both OwnerOnly and Allowlist accept events from
-                            // "siblings" — pubkeys whose agent_owner_pubkey
-                            // matches this agent's owner (e.g. other bots
-                            // launched by the same human). Allowlist adds the
-                            // explicit pubkey list on top, for external people;
-                            // it never revokes same-owner team bots.
+                            // OwnerOnly and default Allowlist accept same-owner
+                            // sibling agents. Strict Allowlist admits only explicit
+                            // pubkeys, so a managed agent can ignore its siblings.
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -9563,6 +9574,7 @@ mod build_mcp_servers_tests {
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
+            strict_allowlist: false,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,
@@ -10255,6 +10267,7 @@ mod error_outcome_emission_tests {
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            strict_allowlist: false,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,

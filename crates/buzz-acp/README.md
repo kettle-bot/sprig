@@ -141,7 +141,8 @@ Controls which authors' events the harness forwards to the agent. Events from di
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `allowlist`, `anyone`, `nobody`. |
-| `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is always implicitly included. |
+| `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is implicitly included unless strict mode is enabled. |
+| `--strict-allowlist` | `BUZZ_ACP_STRICT_ALLOWLIST` | `false` | In allowlist mode, admit only listed pubkeys; exclude the implicit owner and same-owner agents. |
 
 **Modes:**
 
@@ -158,6 +159,9 @@ and verified sibling agents. `owner-only` and `anyone` admit only owner/siblings
 admission. Missing, failed, or unrecognized channel metadata never grants an
 external author access, including under `allowlist` or `anyone`; resolution is
 retried for later events. This policy is shared by normal and setup listeners.
+With `--strict-allowlist`, only listed pubkeys are admitted in verified channels
+and DMs, including when the owner or a same-owner agent sends the event. Unknown
+channel metadata still fails closed. The flag requires `--respond-to allowlist`.
 Signature checks, relay membership, workflow attribution, and session/audience
 boundaries still apply.
 
@@ -198,6 +202,10 @@ buzz-acp
 # Respond to a team of three users (owner always included automatically)
 buzz-acp --respond-to allowlist \
   --respond-to-allowlist "abc123...64hex,def456...64hex,789abc...64hex"
+
+# Respond only to this customer, excluding same-owner agents
+buzz-acp --respond-to allowlist --strict-allowlist \
+  --respond-to-allowlist "abc123...64hex"
 
 # Respond to anyone (open agent)
 buzz-acp --respond-to anyone

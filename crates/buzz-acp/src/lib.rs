@@ -354,6 +354,7 @@ mod inbound_author_gate {
         pub(crate) effective_author: String,
         pub(crate) allowed: bool,
         pub(crate) is_dm: bool,
+        pub(crate) channel_trust: &'static str,
     }
 
     /// An event that passed the complete listener author boundary.
@@ -520,7 +521,7 @@ mod inbound_author_gate {
             {
                 Some(info) => match info.channel_type.as_str() {
                     "dm" => ChannelTrust::Dm,
-                    "stream" | "forum" => ChannelTrust::Channel,
+                    "stream" | "forum" | "private" => ChannelTrust::Channel,
                     _ => ChannelTrust::Unknown,
                 },
                 None => ChannelTrust::Unknown,
@@ -561,6 +562,11 @@ mod inbound_author_gate {
                 effective_author,
                 allowed,
                 is_dm: !matches!(channel_trust, ChannelTrust::Channel),
+                channel_trust: match channel_trust {
+                    ChannelTrust::Dm => "dm",
+                    ChannelTrust::Channel => "channel",
+                    ChannelTrust::Unknown => "unknown",
+                },
             }
         }
 
@@ -590,6 +596,7 @@ mod inbound_author_gate {
                     effective_author = %decision.effective_author,
                     mode = %respond_to,
                     is_dm = decision.is_dm,
+                    channel_trust = decision.channel_trust,
                     "inbound author gate — dropping event"
                 );
                 return None;

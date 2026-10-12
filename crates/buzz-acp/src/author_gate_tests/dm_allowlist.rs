@@ -2,6 +2,99 @@
 use super::*;
 
 #[tokio::test]
+async fn strict_allowlist_admits_private_channel_from_signed_metadata() {
+    for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+        let channel_id = Uuid::new_v4();
+        let metadata = serde_json::json!([{
+            "tags": [["d", channel_id.to_string()], ["name", "private stream"], ["t", "private"]]
+        }]);
+        let (resolver, _, metadata_server) = lazy_resolver_with_response(metadata).await;
+        let sender = nostr::Keys::generate();
+        let author = sender.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let relay = nostr::Keys::generate().public_key().to_hex();
+        let (rest, nip11_server) = nip11_server(serde_json::json!({ "self": relay })).await;
+        let mut gate = InboundAuthorGate::connect(&rest, &agent, "private stream", true).await;
+        let owner = OwnerCache::new(Some(nostr::Keys::generate().public_key().to_hex()));
+        let event = relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id,
+            event: nostr::EventBuilder::new(
+                nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                "Private stream mention",
+            )
+            .tags([
+                nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                nostr::Tag::parse(["p", &agent]).unwrap(),
+            ])
+            .sign_with_keys(&sender)
+            .unwrap(),
+        };
+        event.event.verify().unwrap();
+        let allowlist = HashSet::from([author.clone()]);
+        let decision = gate
+            .evaluate_listener_event(
+                &event,
+                &RespondTo::Allowlist,
+                &allowlist,
+                &owner,
+                &resolver,
+                &rest,
+            )
+            .await;
+        assert_eq!(decision.channel_trust, "channel");
+        assert!(
+            decision.allowed,
+            "{} rejected allowlisted private stream author",
+            listener.name()
+        );
+        let authorized = match listener {
+            ListenerBoundary::Normal => {
+                authorize_normal_listener_event(
+                    &mut gate,
+                    event.clone(),
+                    &RespondTo::Allowlist,
+                    &allowlist,
+                    &owner,
+                    &resolver,
+                    &rest,
+                )
+                .await
+            }
+            ListenerBoundary::Setup => {
+                setup_mode::authorize_setup_listener_event(
+                    &mut gate,
+                    event.clone(),
+                    &RespondTo::Allowlist,
+                    &allowlist,
+                    &owner,
+                    &resolver,
+                    &rest,
+                )
+                .await
+            }
+        };
+        assert_eq!(authorized.unwrap().into_parts().1, author);
+        assert!(
+            gate.authorize_listener_event(
+                event,
+                &RespondTo::Allowlist,
+                &HashSet::new(),
+                &owner,
+                &resolver,
+                &rest,
+            )
+            .await
+            .is_none(),
+            "{} admitted an unlisted author",
+            listener.name()
+        );
+        nip11_server.abort();
+        metadata_server.abort();
+    }
+}
+
+#[tokio::test]
 async fn signed_dm_policy_matrix_and_revocation() {
     let (metadata_rest, metadata_server) = nip11_server(serde_json::json!([])).await;
     for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {

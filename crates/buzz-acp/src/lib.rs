@@ -7299,8 +7299,7 @@ mod author_gate_tests {
         let agent = nostr::Keys::generate().public_key().to_hex();
         let (rest_client, server) = nip11_scripted_server(responses).await;
         let mut gate =
-            InboundAuthorGate::connect(&rest_client, &agent, "listener startup", strict_allowlist)
-                .await;
+            InboundAuthorGate::connect(&rest_client, &agent, "listener startup", false).await;
         let configured_owner = if cache_owner {
             Some(workflow_owner.to_string())
         } else if cache_sibling {

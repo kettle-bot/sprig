@@ -119,8 +119,8 @@ async fn strict_allowlist_excludes_implicit_owner_and_siblings_on_both_listeners
         let author = sender.public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
         let relay = nostr::Keys::generate().public_key().to_hex();
-        let (mut gate, rest, server) = connected_gate(&relay, &agent).await;
-        gate.set_strict_allowlist(true);
+        let (rest, server) = nip11_server(serde_json::json!({ "self": relay })).await;
+        let mut gate = InboundAuthorGate::connect(&rest, &agent, "strict policy test", true).await;
         for channel_type in ["dm", "stream", "unknown"] {
             let channel_id = Uuid::new_v4();
             let channel_info = pool::ChannelInfoResolver::new(

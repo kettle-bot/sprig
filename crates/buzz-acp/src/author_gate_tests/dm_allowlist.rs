@@ -110,3 +110,95 @@ async fn signed_dm_policy_matrix_and_revocation() {
     }
     metadata_server.abort();
 }
+
+#[tokio::test]
+async fn strict_allowlist_excludes_implicit_owner_and_siblings_on_both_listeners() {
+    let (metadata_rest, metadata_server) = nip11_server(serde_json::json!([])).await;
+    for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+        let sender = nostr::Keys::generate();
+        let author = sender.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let relay = nostr::Keys::generate().public_key().to_hex();
+        let (mut gate, rest, server) = connected_gate(&relay, &agent).await;
+        gate.set_strict_allowlist(true);
+        for channel_type in ["dm", "stream", "unknown"] {
+            let channel_id = Uuid::new_v4();
+            let channel_info = pool::ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel_id,
+                    relay::ChannelInfo {
+                        name: "strict policy test".into(),
+                        channel_type: channel_type.into(),
+                        description: None,
+                    },
+                )]),
+                metadata_rest.clone(),
+            );
+            for principal in ["external", "owner", "sibling"] {
+                let cache = OwnerCache::new(Some(if principal == "owner" {
+                    author.clone()
+                } else {
+                    nostr::Keys::generate().public_key().to_hex()
+                }));
+                cache.cache_sibling(author.clone(), principal == "sibling");
+                for listed in [true, false, true] {
+                    let allowlist = if listed {
+                        HashSet::from([author.clone()])
+                    } else {
+                        HashSet::new()
+                    };
+                    let event = nostr::EventBuilder::new(
+                        nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                        "Please reply in this conversation",
+                    )
+                    .tags([
+                        nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                        nostr::Tag::parse(["p", &agent]).unwrap(),
+                    ])
+                    .sign_with_keys(&sender)
+                    .unwrap();
+                    event.verify().unwrap();
+                    let event = relay::BuzzEvent {
+                        connection_generation: 0,
+                        channel_id,
+                        event,
+                    };
+                    let authorized = match listener {
+                        ListenerBoundary::Normal => {
+                            authorize_normal_listener_event(
+                                &mut gate,
+                                event,
+                                &RespondTo::Allowlist,
+                                &allowlist,
+                                &cache,
+                                &channel_info,
+                                &rest,
+                            )
+                            .await
+                        }
+                        ListenerBoundary::Setup => {
+                            setup_mode::authorize_setup_listener_event(
+                                &mut gate,
+                                event,
+                                &RespondTo::Allowlist,
+                                &allowlist,
+                                &cache,
+                                &channel_info,
+                                &rest,
+                            )
+                            .await
+                        }
+                    };
+                    assert_eq!(
+                        authorized.is_some(),
+                        listed && channel_type != "unknown",
+                        "{} {channel_type} {principal} listed={listed}",
+                        listener.name()
+                    );
+                }
+            }
+        }
+        server.abort();
+    }
+    metadata_server.abort();
+}

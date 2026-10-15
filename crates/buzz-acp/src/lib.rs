@@ -3560,6 +3560,24 @@ async fn run_harness(
                             // OwnerOnly and default Allowlist accept same-owner
                             // sibling agents. Strict Allowlist admits only explicit
                             // pubkeys, so a managed agent can ignore its siblings.
+                            // A human channel post ends a teammate streak even if this
+                            // agent's response policy does not admit its author. The
+                            // subscription can see those posts solely for this reset.
+                            if !config.team_pubkeys.is_empty()
+                                && !team_loop.is_teammate(&buzz_event.event.pubkey.to_hex())
+                            {
+                                let scope = scope::SessionScope::derive(
+                                    config.session_policy,
+                                    buzz_event.channel_id,
+                                    is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await,
+                                    &buzz_event.event,
+                                );
+                                team_loop.observe_human(
+                                    &scope,
+                                    buzz_event.event.id.to_hex(),
+                                    buzz_event.event.kind.as_u16(),
+                                );
+                            }
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -3590,12 +3608,6 @@ async fn run_harness(
                                             targets_team,
                                         );
                                     }
-                                } else {
-                                    team_loop.observe_human(
-                                        &scope,
-                                        event.event.id.to_hex(),
-                                        event.event.kind.as_u16(),
-                                    );
                                 }
                             }
                             let Some(ingress) =

@@ -1009,6 +1009,12 @@ impl NormalListenerIngress {
 
 /// This consumes the admitted ingress so a capped event cannot accidentally
 /// be queued after the check. Callers must handle `None` with `continue`.
+///
+/// Every ingress here has already matched a subscription rule, so it would
+/// start or steer a turn whatever its kind. The cap therefore counts every
+/// teammate-authored ingress and names no kinds: a kind list here once missed
+/// stream reminders and workflow approval requests, which the default mention
+/// rule admits, and would miss any kind a custom rule adds.
 fn gate_team_ingress(
     team_loop: &mut team_loop::TeamLoop,
     scope: &scope::SessionScope,
@@ -1016,10 +1022,6 @@ fn gate_team_ingress(
 ) -> Option<NormalListenerIngress> {
     if team_loop.enabled()
         && team_loop.is_teammate(&ingress.effective_author)
-        && matches!(
-            ingress.buzz_event.event.kind.as_u16(),
-            9 | 40003 | 45001 | 45003
-        )
         && !team_loop.observe_teammate(scope, ingress.buzz_event.event.id.to_hex(), true)
     {
         tracing::info!(
@@ -1510,6 +1512,73 @@ mod team_loop_listener_tests {
         )
         .await
         .is_some());
+    }
+
+    #[tokio::test]
+    async fn production_pipeline_caps_every_kind_the_default_mention_rule_admits() {
+        let alice = Keys::generate();
+        let alice_hex = alice.public_key().to_hex();
+        let agent_hex = Keys::generate().public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let allowlist = HashSet::new();
+        let kinds = config::default_mention_kinds();
+        // Reminders and approval requests are the kinds a fixed list missed.
+        assert!(kinds.contains(&40007) && kinds.contains(&46010));
+        let rules = [SubscriptionRule {
+            kinds: kinds.clone(),
+            ..SubscriptionRule::default()
+        }];
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        for kind in kinds {
+            let mut guard =
+                team_loop::TeamLoop::new(HashSet::from([alice_hex.clone()]), agent_hex.clone(), 1);
+            let mut cache = HumanResetCache::default();
+            let send = |text: &str| {
+                let event = EventBuilder::new(Kind::Custom(kind as u16), text)
+                    .tags(vec![
+                        nostr::Tag::parse(vec!["p", agent_hex.as_str()]).unwrap()
+                    ])
+                    .sign_with_keys(&alice)
+                    .unwrap();
+                AuthorizedListenerEvent::for_test(
+                    relay::BuzzEvent {
+                        connection_generation: 0,
+                        channel_id,
+                        event,
+                    },
+                    alice_hex.clone(),
+                )
+            };
+            let context = || TeamListenerContext {
+                channel_id,
+                owner: None,
+                allowlist: &allowlist,
+                rules: &rules,
+                agent_pubkey: &agent_hex,
+                is_dm: false,
+                rest_client: &rest,
+            };
+            // Control: the rule admits this kind, and it spends the one slot.
+            let first = send("first");
+            assert!(
+                process_team_listener_event(Some(first), &mut guard, &mut cache, context())
+                    .await
+                    .is_some(),
+                "kind {kind} must be admitted before the cap"
+            );
+            let second = send("second");
+            assert!(
+                process_team_listener_event(Some(second), &mut guard, &mut cache, context())
+                    .await
+                    .is_none(),
+                "kind {kind} from a teammate must be dropped after the cap"
+            );
+        }
     }
 
     #[tokio::test]

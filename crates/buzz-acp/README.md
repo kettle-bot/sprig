@@ -141,7 +141,8 @@ Controls which authors' events the harness forwards to the agent. Events from di
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `allowlist`, `anyone`, `nobody`. |
-| `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is always implicitly included. |
+| `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is implicitly included unless strict mode is enabled. |
+| `--strict-allowlist` | `BUZZ_ACP_STRICT_ALLOWLIST` | `false` | In allowlist mode, admit only listed pubkeys; exclude the implicit owner and same-owner agents. |
 
 **Modes:**
 
@@ -149,8 +150,20 @@ Controls which authors' events the harness forwards to the agent. Events from di
 |------|----------|
 | `owner-only` | Forward only events from the agent's registered owner. If no owner is set, all events are dropped until the owner is resolved. |
 | `allowlist` | Forward events from the listed pubkeys plus the owner. |
-| `anyone` | Forward all events (no author filtering). |
+| `anyone` | Forward all authors in verified non-DM channels; DMs remain owner/sibling-only. |
 | `nobody` | Drop all inbound events. Agent only acts on heartbeat prompts. |
+
+In a verified DM, `allowlist` admits explicitly listed public keys plus the owner
+and verified sibling agents. `owner-only` and `anyone` admit only owner/siblings;
+`nobody` denies everyone. Removing a key from the effective allowlist revokes its
+admission. Missing, failed, or unrecognized channel metadata never grants an
+external author access, including under `allowlist` or `anyone`; resolution is
+retried for later events. This policy is shared by normal and setup listeners.
+With `--strict-allowlist`, only listed pubkeys are admitted in verified channels
+and DMs, including when the owner or a same-owner agent sends the event. Unknown
+channel metadata still fails closed. The flag requires `--respond-to allowlist`.
+Signature checks, relay membership, workflow attribution, and session/audience
+boundaries still apply.
 
 Relay-signed workflow messages delegate to their recorded owner only when they
 explicitly target this agent with authenticated workflow-mention provenance.
@@ -178,7 +191,7 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   --mention <agent-pubkey> --content '!cancel'
 ```
 
-> **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.
+> **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. `--respond-to anyone` broadens verified non-DM channels only.
 
 **Examples:**
 
@@ -189,6 +202,10 @@ buzz-acp
 # Respond to a team of three users (owner always included automatically)
 buzz-acp --respond-to allowlist \
   --respond-to-allowlist "abc123...64hex,def456...64hex,789abc...64hex"
+
+# Respond only to this customer, excluding same-owner agents
+buzz-acp --respond-to allowlist --strict-allowlist \
+  --respond-to-allowlist "abc123...64hex"
 
 # Respond to anyone (open agent)
 buzz-acp --respond-to anyone

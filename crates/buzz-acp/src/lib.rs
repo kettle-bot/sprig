@@ -23,6 +23,7 @@ mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
+mod team_loop;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -533,8 +534,8 @@ fn effective_prompt_author(
 /// dropping the load inside it fails the construction regressions.
 mod inbound_author_gate {
     use super::{
-        effective_prompt_author, is_dm_channel, is_owner_or_sibling, pool, refresh_relay_self,
-        relay, OwnerCache, RespondTo,
+        effective_prompt_author, is_owner_or_sibling, pool, refresh_relay_self, relay, OwnerCache,
+        RespondTo,
     };
     use std::collections::HashSet;
 
@@ -542,6 +543,7 @@ mod inbound_author_gate {
         pub(crate) effective_author: String,
         pub(crate) allowed: bool,
         pub(crate) is_dm: bool,
+        pub(crate) channel_trust: &'static str,
     }
 
     /// An event that passed the complete listener author boundary.
@@ -557,8 +559,42 @@ mod inbound_author_gate {
     }
 
     impl AuthorizedListenerEvent {
+        #[cfg(test)]
+        pub(crate) fn for_test(buzz_event: relay::BuzzEvent, effective_author: String) -> Self {
+            Self {
+                buzz_event,
+                effective_author,
+            }
+        }
+
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
+        }
+
+        pub(crate) fn event(&self) -> &relay::BuzzEvent {
+            &self.buzz_event
+        }
+
+        pub(crate) fn effective_author(&self) -> &str {
+            &self.effective_author
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ChannelTrust {
+        Unknown,
+        Dm,
+        Channel,
+    }
+
+    impl ChannelTrust {
+        #[cfg(test)]
+        fn known(is_dm: bool) -> Self {
+            if is_dm {
+                Self::Dm
+            } else {
+                Self::Channel
+            }
         }
     }
 
@@ -569,25 +605,25 @@ mod inbound_author_gate {
     async fn author_allowed(
         respond_to: &RespondTo,
         allowlist: &HashSet<String>,
+        strict_allowlist: bool,
         author: &str,
-        is_dm: bool,
+        channel_trust: ChannelTrust,
         owner_cache: &OwnerCache,
         rest_client: &relay::RestClient,
     ) -> bool {
-        if is_dm {
-            return match respond_to {
-                RespondTo::Nobody => false,
-                _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
-            };
-        }
         match respond_to {
-            RespondTo::Anyone => true,
             RespondTo::Nobody => false,
-            RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
-            RespondTo::Allowlist => {
-                allowlist.contains(author)
-                    || is_owner_or_sibling(author, owner_cache, rest_client).await
+            RespondTo::Anyone if matches!(channel_trust, ChannelTrust::Channel) => true,
+            RespondTo::Allowlist if strict_allowlist => {
+                !matches!(channel_trust, ChannelTrust::Unknown) && allowlist.contains(author)
             }
+            RespondTo::Allowlist
+                if !matches!(channel_trust, ChannelTrust::Unknown)
+                    && allowlist.contains(author) =>
+            {
+                true
+            }
+            _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
         }
     }
 
@@ -603,8 +639,9 @@ mod inbound_author_gate {
         author_allowed(
             respond_to,
             allowlist,
+            false,
             author,
-            is_dm,
+            ChannelTrust::known(is_dm),
             owner_cache,
             rest_client,
         )
@@ -613,6 +650,7 @@ mod inbound_author_gate {
 
     pub(crate) struct InboundAuthorGate {
         agent_pubkey_hex: String,
+        strict_allowlist: bool,
         relay_self: Option<String>,
         // None means no authoritative NIP-11 result yet, including at startup.
         refreshed_generation: Option<u64>,
@@ -628,10 +666,12 @@ mod inbound_author_gate {
             rest_client: &relay::RestClient,
             agent_pubkey_hex: &str,
             context: &str,
+            strict_allowlist: bool,
         ) -> Self {
             let (relay_self, completed) = refresh_relay_self(rest_client, None, context).await;
             Self {
                 agent_pubkey_hex: agent_pubkey_hex.to_string(),
+                strict_allowlist,
                 relay_self,
                 refreshed_generation: completed.then_some(0),
             }
@@ -679,12 +719,23 @@ mod inbound_author_gate {
                     self.refreshed_generation = Some(buzz_event.connection_generation);
                 }
             }
-            let is_dm = is_dm_channel(buzz_event.channel_id, channel_info).await;
+            // Unknown metadata must not inherit the explicit DM allowlist exception.
+            let channel_trust = match channel_info
+                .resolve_channel_metadata(buzz_event.channel_id)
+                .await
+            {
+                Some(info) => match info.channel_type.as_str() {
+                    "dm" => ChannelTrust::Dm,
+                    "stream" | "forum" | "private" => ChannelTrust::Channel,
+                    _ => ChannelTrust::Unknown,
+                },
+                None => ChannelTrust::Unknown,
+            };
             self.evaluate_with_channel_trust(
                 &buzz_event.event,
                 respond_to,
                 allowlist,
-                is_dm,
+                channel_trust,
                 owner_cache,
                 rest_client,
             )
@@ -696,7 +747,7 @@ mod inbound_author_gate {
             event: &nostr::Event,
             respond_to: &RespondTo,
             allowlist: &HashSet<String>,
-            is_dm: bool,
+            channel_trust: ChannelTrust,
             owner_cache: &OwnerCache,
             rest_client: &relay::RestClient,
         ) -> InboundAuthorGateDecision {
@@ -705,8 +756,9 @@ mod inbound_author_gate {
             let allowed = author_allowed(
                 respond_to,
                 allowlist,
+                self.strict_allowlist,
                 &effective_author,
-                is_dm,
+                channel_trust,
                 owner_cache,
                 rest_client,
             )
@@ -714,7 +766,12 @@ mod inbound_author_gate {
             InboundAuthorGateDecision {
                 effective_author,
                 allowed,
-                is_dm,
+                is_dm: !matches!(channel_trust, ChannelTrust::Channel),
+                channel_trust: match channel_trust {
+                    ChannelTrust::Dm => "dm",
+                    ChannelTrust::Channel => "channel",
+                    ChannelTrust::Unknown => "unknown",
+                },
             }
         }
 
@@ -747,6 +804,7 @@ mod inbound_author_gate {
                     effective_author = %decision.effective_author,
                     mode = %respond_to,
                     is_dm = decision.is_dm,
+                    channel_trust = decision.channel_trust,
                     "inbound author gate — dropping event"
                 );
                 return None;
@@ -771,7 +829,7 @@ mod inbound_author_gate {
                 event,
                 respond_to,
                 allowlist,
-                is_dm,
+                ChannelTrust::known(is_dm),
                 owner_cache,
                 rest_client,
             )
@@ -949,6 +1007,107 @@ impl NormalListenerIngress {
     }
 }
 
+/// This consumes the admitted ingress so a capped event cannot accidentally
+/// be queued after the check. Callers must handle `None` with `continue`.
+fn gate_team_ingress(
+    team_loop: &mut team_loop::TeamLoop,
+    scope: &scope::SessionScope,
+    ingress: NormalListenerIngress,
+) -> Option<NormalListenerIngress> {
+    if team_loop.enabled()
+        && team_loop.is_teammate(&ingress.effective_author)
+        && matches!(
+            ingress.buzz_event.event.kind.as_u16(),
+            9 | 40003 | 45001 | 45003
+        )
+        && !team_loop.observe_teammate(scope, ingress.buzz_event.event.id.to_hex(), true)
+    {
+        tracing::info!(
+            channel_id = %ingress.buzz_event.channel_id,
+            scope = %scope.telemetry_label(),
+            "team loop limit reached — dropping teammate trigger"
+        );
+        return None;
+    }
+    Some(ingress)
+}
+
+fn ignore_self_with_team_count(
+    team_loop: &mut team_loop::TeamLoop,
+    ignore_self: bool,
+    own_pubkey: &str,
+    channel_id: Uuid,
+    is_dm: bool,
+    event: &nostr::Event,
+) -> bool {
+    if !ignore_self || event.pubkey.to_hex() != own_pubkey {
+        return false;
+    }
+    team_loop.observe_self_event(channel_id, is_dm, event);
+    true
+}
+
+/// One authorized event's complete team and subscription path. An author-gate
+/// rejection is represented by `None` and cannot touch the reset counter.
+struct TeamListenerContext<'a> {
+    channel_id: Uuid,
+    owner: Option<&'a str>,
+    allowlist: &'a HashSet<String>,
+    rules: &'a [SubscriptionRule],
+    agent_pubkey: &'a str,
+    is_dm: bool,
+    rest_client: &'a relay::RestClient,
+}
+
+async fn process_team_listener_event(
+    authorized: Option<AuthorizedListenerEvent>,
+    team_loop: &mut team_loop::TeamLoop,
+    human_reset_cache: &mut HumanResetCache,
+    context: TeamListenerContext<'_>,
+) -> Option<NormalListenerIngress> {
+    let authorized = authorized?;
+    if authorized.event().channel_id != context.channel_id {
+        return None;
+    }
+    if team_loop.enabled() {
+        if admitted_human_can_reset(
+            &authorized,
+            team_loop,
+            context.owner,
+            context.allowlist,
+            context.rest_client,
+            human_reset_cache,
+        )
+        .await
+        {
+            let event = authorized.event();
+            let scope =
+                team_loop::TeamLoop::scope(event.channel_id, context.is_dm, &event.event, None);
+            team_loop.observe_human(&scope, event.event.id.to_hex(), event.event.kind.as_u16());
+        }
+        let event = authorized.event();
+        if team_loop.is_teammate(authorized.effective_author())
+            && matches!(event.event.kind.as_u16(), 9 | 45001 | 45003)
+        {
+            let scope =
+                team_loop::TeamLoop::scope(event.channel_id, context.is_dm, &event.event, None);
+            let targets_team = team_loop.targets_team(&event.event);
+            team_loop.observe_teammate(&scope, event.event.id.to_hex(), targets_team);
+        }
+    }
+    let ingress = AuthorizedNormalListenerEvent(authorized)
+        .match_subscription(context.rules, context.agent_pubkey)
+        .await?;
+    let ingress = ingress.resolve_edit_routing(context.rest_client).await;
+    let team_scope = team_loop::TeamLoop::scope(
+        ingress.buzz_event.channel_id,
+        context.is_dm,
+        &ingress.buzz_event.event,
+        ingress.edit.as_ref(),
+    );
+    gate_team_ingress(team_loop, &team_scope, ingress)
+}
+
 /// Apply the complete normal-listener author boundary for one relay event.
 ///
 /// The event is consumed here, so the production loop cannot recover it except
@@ -972,6 +1131,433 @@ async fn authorize_normal_listener_event(
             rest_client,
         )
         .await
+}
+
+/// Only a verified, admitted human can release a teammate streak. The
+/// membership role is relay-owned; the profile's NIP-OA tag is a conservative
+/// agent signal even when the attestation belongs to another customer.
+#[derive(Default)]
+struct HumanResetCache {
+    entries: HashMap<(Uuid, String), (std::time::Instant, bool)>,
+}
+
+impl HumanResetCache {
+    fn get(&self, channel_id: Uuid, author: &str) -> Option<bool> {
+        self.entries
+            .get(&(channel_id, author.to_owned()))
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
+            .map(|(_, human)| *human)
+    }
+
+    fn insert(&mut self, channel_id: Uuid, author: &str, human: bool) {
+        if self.entries.len() >= 4096 {
+            self.entries
+                .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
+            if self.entries.len() >= 4096 {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(
+            (channel_id, author.to_owned()),
+            (std::time::Instant::now(), human),
+        );
+    }
+}
+
+async fn admitted_human_can_reset(
+    admitted: &AuthorizedListenerEvent,
+    team_loop: &team_loop::TeamLoop,
+    owner: Option<&str>,
+    allowlist: &HashSet<String>,
+    rest_client: &relay::RestClient,
+    cache: &mut HumanResetCache,
+) -> bool {
+    if !matches!(admitted.event().event.kind.as_u16(), 9 | 45001 | 45003) {
+        return false;
+    }
+    let author = admitted.effective_author();
+    if !eligible_reset_principal(
+        author,
+        &admitted.event().event.pubkey.to_hex(),
+        team_loop,
+        owner,
+        allowlist,
+    ) {
+        return false;
+    }
+    let channel_id = admitted.event().channel_id;
+    if let Some(human) = cache.get(channel_id, author) {
+        return human;
+    }
+    let member_filter = serde_json::json!({
+        "kinds": [39002], "#d": [channel_id.to_string()], "limit": 1,
+        "consistency": "strong"
+    });
+    let profile_filter = serde_json::json!({
+        "kinds": [0], "authors": [author], "limit": 1
+    });
+    let member_filters = [member_filter];
+    let profile_filters = [profile_filter];
+    let (members, profile) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rest_client.query_raw(&member_filters)
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rest_client.query_raw(&profile_filters)
+        ),
+    );
+    let (Ok(Ok(members)), Ok(Ok(profile))) = (members, profile) else {
+        return false;
+    };
+    let human = human_member_and_profile(author, owner, &members, &profile);
+    cache.insert(channel_id, author, human);
+    human
+}
+
+fn eligible_reset_principal(
+    effective_author: &str,
+    raw_author: &str,
+    team_loop: &team_loop::TeamLoop,
+    owner: Option<&str>,
+    allowlist: &HashSet<String>,
+) -> bool {
+    !team_loop.is_teammate(effective_author)
+        && (Some(effective_author) == owner || allowlist.contains(effective_author))
+        // A relay-signed workflow post is never a human reset, even when it
+        // carries a verified effective owner.
+        && raw_author == effective_author
+}
+
+fn human_member_and_profile(
+    author: &str,
+    owner: Option<&str>,
+    members: &serde_json::Value,
+    profile: &serde_json::Value,
+) -> bool {
+    let role = members
+        .as_array()
+        .and_then(|events| events.first())
+        .and_then(|event| event.get("tags"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tags| {
+            tags.iter().find_map(|tag| {
+                let fields = tag.as_array()?;
+                (fields.first()?.as_str() == Some("p") && fields.get(1)?.as_str() == Some(author))
+                    .then(|| {
+                        fields
+                            .get(3)
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|role| !role.is_empty())
+                            .unwrap_or("member")
+                    })
+            })
+        });
+    if !matches!(role, Some("owner" | "admin" | "member" | "guest")) {
+        return false;
+    }
+    // A missing profile cannot prove an allowlisted identity is human. The
+    // bound owner remains an explicit human authority without one.
+    let profile_tags = profile
+        .as_array()
+        .and_then(|events| events.first())
+        .and_then(|event| event.get("tags"))
+        .and_then(serde_json::Value::as_array);
+    if profile_tags.is_none() && Some(author) != owner {
+        return false;
+    }
+    !profile_tags.is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            tag.as_array()
+                .and_then(|fields| fields.first())
+                .and_then(serde_json::Value::as_str)
+                == Some("auth")
+        })
+    })
+}
+
+#[cfg(test)]
+mod team_loop_listener_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    #[test]
+    fn human_classification_cache_is_per_channel_and_expires() {
+        let mut cache = HumanResetCache::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        cache.insert(first, "human", true);
+        assert_eq!(cache.get(first, "human"), Some(true));
+        assert_eq!(cache.get(second, "human"), None);
+        assert_eq!(cache.get(first, "other"), None);
+        cache.entries.get_mut(&(first, "human".into())).unwrap().0 =
+            std::time::Instant::now() - Duration::from_secs(61);
+        assert_eq!(cache.get(first, "human"), None);
+    }
+
+    #[test]
+    fn admitted_teammate_edits_and_messages_drop_after_self_spends_budget() {
+        let teammate = Keys::generate();
+        let agent = Keys::generate();
+        let teammate_hex = teammate.public_key().to_hex();
+        let mut guard = team_loop::TeamLoop::new(
+            HashSet::from([teammate_hex.clone()]),
+            agent.public_key().to_hex(),
+            2,
+        );
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Thread {
+            channel_id,
+            root_event_id: "a".repeat(64),
+        };
+        // The listener observes its own team-addressed post before ignoring
+        // that self-authored event; it still spends one of the two slots.
+        assert!(guard.observe_teammate(&scope, "self-post".into(), true));
+        let ingress = |kind, text: &str| NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event: EventBuilder::new(Kind::Custom(kind), text)
+                    .sign_with_keys(&teammate)
+                    .unwrap(),
+            },
+            effective_author: teammate_hex.clone(),
+            prompt_tag: "test".into(),
+            edit: None,
+        };
+        assert!(gate_team_ingress(&mut guard, &scope, ingress(9, "first")).is_some());
+        assert!(gate_team_ingress(&mut guard, &scope, ingress(40003, "edit")).is_none());
+    }
+
+    #[test]
+    fn only_admitted_direct_humans_can_reset_and_bot_roles_never_can() {
+        let owner = "a".repeat(64);
+        let human = "b".repeat(64);
+        let relay = "c".repeat(64);
+        let bot = "d".repeat(64);
+        let guard = team_loop::TeamLoop::new(HashSet::from([bot.clone()]), "self".into(), 6);
+        let allowlist = HashSet::from([human.clone(), bot.clone()]);
+        assert!(eligible_reset_principal(
+            &owner,
+            &owner,
+            &guard,
+            Some(&owner),
+            &allowlist
+        ));
+        assert!(eligible_reset_principal(
+            &human,
+            &human,
+            &guard,
+            Some(&owner),
+            &allowlist
+        ));
+        assert!(!eligible_reset_principal(
+            &human,
+            &relay,
+            &guard,
+            Some(&owner),
+            &allowlist
+        ));
+        assert!(!eligible_reset_principal(
+            &bot,
+            &bot,
+            &guard,
+            Some(&owner),
+            &allowlist
+        ));
+        assert!(!eligible_reset_principal(
+            &relay,
+            &relay,
+            &guard,
+            Some(&owner),
+            &allowlist
+        ));
+
+        let members = |role| serde_json::json!([{"tags": [["p", human, "", role]]}]);
+        let plain = serde_json::json!([{"tags": []}]);
+        let nip_oa = serde_json::json!([{"tags": [["auth", owner, "", "signature"]]}]);
+        assert!(human_member_and_profile(
+            &human,
+            Some(&owner),
+            &members("member"),
+            &plain
+        ));
+        assert!(human_member_and_profile(
+            &human,
+            Some(&owner),
+            &serde_json::json!([{"tags": [["p", human]]}]),
+            &plain
+        ));
+        assert!(!human_member_and_profile(
+            &human,
+            Some(&owner),
+            &members("bot"),
+            &plain
+        ));
+        assert!(!human_member_and_profile(
+            &human,
+            Some(&owner),
+            &members("member"),
+            &nip_oa
+        ));
+        assert!(!human_member_and_profile(
+            &human,
+            Some(&owner),
+            &members("member"),
+            &serde_json::json!([])
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_pipeline_caps_top_level_posts_and_resets_only_after_human_admission() {
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let human = Keys::generate();
+        let outsider = Keys::generate();
+        let alice_hex = alice.public_key().to_hex();
+        let bob_hex = bob.public_key().to_hex();
+        let human_hex = human.public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let mut guard = team_loop::TeamLoop::new(
+            HashSet::from([alice_hex.clone(), bob_hex.clone()]),
+            "self".into(),
+            6,
+        );
+        let mut cache = HumanResetCache::default();
+        cache.insert(channel_id, &human_hex, true);
+        let allowlist = HashSet::from([human_hex.clone()]);
+        let rules = [SubscriptionRule::default()];
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let context = || TeamListenerContext {
+            channel_id,
+            owner: None,
+            allowlist: &allowlist,
+            rules: &rules,
+            agent_pubkey: "self",
+            is_dm: false,
+            rest_client: &rest,
+        };
+        let admitted = |keys: &Keys, target: &str, text: &str| {
+            let event = EventBuilder::new(Kind::Custom(9), text)
+                .tags(vec![nostr::Tag::parse(vec!["p", target]).unwrap()])
+                .sign_with_keys(keys)
+                .unwrap();
+            AuthorizedListenerEvent::for_test(
+                relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event,
+                },
+                keys.public_key().to_hex(),
+            )
+        };
+        for i in 0..6 {
+            let (keys, target) = if i % 2 == 0 {
+                (&alice, bob_hex.as_str())
+            } else {
+                (&bob, alice_hex.as_str())
+            };
+            assert!(process_team_listener_event(
+                Some(admitted(keys, target, &format!("ping {i}"))),
+                &mut guard,
+                &mut cache,
+                context()
+            )
+            .await
+            .is_some());
+        }
+        // An author-gate rejection or unrelated admitted bot must not reset.
+        assert!(
+            process_team_listener_event(None, &mut guard, &mut cache, context())
+                .await
+                .is_none()
+        );
+        assert!(process_team_listener_event(
+            Some(admitted(&outsider, &alice_hex, "outsider")),
+            &mut guard,
+            &mut cache,
+            context()
+        )
+        .await
+        .is_some());
+        assert!(process_team_listener_event(
+            Some(admitted(&alice, &bob_hex, "seventh")),
+            &mut guard,
+            &mut cache,
+            context()
+        )
+        .await
+        .is_none());
+        assert!(process_team_listener_event(
+            Some(admitted(&human, &alice_hex, "human reset")),
+            &mut guard,
+            &mut cache,
+            context()
+        )
+        .await
+        .is_some());
+        assert!(process_team_listener_event(
+            Some(admitted(&bob, &alice_hex, "after reset")),
+            &mut guard,
+            &mut cache,
+            context()
+        )
+        .await
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn self_post_spends_pipeline_budget() {
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let peer_hex = peer.public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let mut guard = team_loop::TeamLoop::new(
+            HashSet::from([peer_hex.clone()]),
+            agent.public_key().to_hex(),
+            1,
+        );
+        let self_event = EventBuilder::new(Kind::Custom(9), "delegate")
+            .tags(vec![
+                nostr::Tag::parse(vec!["p", peer_hex.as_str()]).unwrap()
+            ])
+            .sign_with_keys(&agent)
+            .unwrap();
+        assert!(ignore_self_with_team_count(
+            &mut guard,
+            true,
+            &agent.public_key().to_hex(),
+            channel_id,
+            false,
+            &self_event,
+        ));
+        let peer_event = EventBuilder::new(Kind::Custom(9), "reply")
+            .tags(vec![nostr::Tag::parse(vec![
+                "p",
+                agent.public_key().to_hex().as_str(),
+            ])
+            .unwrap()])
+            .sign_with_keys(&peer)
+            .unwrap();
+        let ingress = NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event: peer_event,
+            },
+            effective_author: peer_hex,
+            prompt_tag: "test".into(),
+            edit: None,
+        };
+        let scope = team_loop::TeamLoop::scope(channel_id, false, &ingress.buzz_event.event, None);
+        assert!(gate_team_ingress(&mut guard, &scope, ingress).is_none());
+    }
 }
 
 /// Refresh the relay signing identity, logging why delegated workflow
@@ -2959,8 +3545,13 @@ async fn run_harness(
     tracing::info!("connected to relay at {}", config.relay_url);
 
     let relay_rest_client = relay.rest_client();
-    let mut author_gate_ctx =
-        InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
+    let mut author_gate_ctx = InboundAuthorGate::connect(
+        &relay_rest_client,
+        &pubkey_hex,
+        "startup",
+        config.strict_allowlist,
+    )
+    .await;
 
     relay
         .subscribe_membership_notifications()
@@ -3076,6 +3667,12 @@ async fn run_harness(
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let mut team_loop = team_loop::TeamLoop::new(
+        config.team_pubkeys.clone(),
+        pubkey_hex.clone(),
+        config.team_loop_limit,
+    );
+    let mut human_reset_cache = HumanResetCache::default();
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -3599,7 +4196,21 @@ async fn run_harness(
                                 continue;
                             }
 
-                            if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                            let self_is_dm = if config.ignore_self
+                                && buzz_event.event.pubkey.to_hex() == pubkey_hex
+                            {
+                                is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await
+                            } else {
+                                false
+                            };
+                            if ignore_self_with_team_count(
+                                &mut team_loop,
+                                config.ignore_self,
+                                &pubkey_hex,
+                                    buzz_event.channel_id,
+                                    self_is_dm,
+                                    &buzz_event.event,
+                            ) {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
                             }
@@ -3743,13 +4354,11 @@ async fn run_harness(
                             // agent. Must be AFTER !shutdown (owner can always
                             // shut down regardless of gate mode).
                             //
-                            // Both OwnerOnly and Allowlist accept events from
-                            // "siblings" — pubkeys whose agent_owner_pubkey
-                            // matches this agent's owner (e.g. other bots
-                            // launched by the same human). Allowlist adds the
-                            // explicit pubkey list on top, for external people;
-                            // it never revokes same-owner team bots.
-                            let Some(authorized_event) = authorize_normal_listener_event(
+                            // OwnerOnly and default Allowlist accept same-owner
+                            // sibling agents. Strict Allowlist admits only explicit
+                            // pubkeys, so a managed agent can ignore its siblings.
+                            let channel_id = buzz_event.channel_id;
+                            let authorized_event = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
                                 &config.respond_to,
@@ -3758,19 +4367,29 @@ async fn run_harness(
                                 &ctx.channel_info,
                                 &ctx.rest_client,
                             )
-                            .await
+                            .await;
+                            let is_dm = if let Some(event) = authorized_event.as_ref() {
+                                is_dm_channel(event.event().channel_id, &ctx.channel_info).await
+                            } else {
+                                false
+                            };
+                            let Some(ingress) = process_team_listener_event(
+                                authorized_event,
+                                &mut team_loop,
+                                &mut human_reset_cache,
+                                TeamListenerContext {
+                                    channel_id,
+                                    owner: owner_cache.get(),
+                                    allowlist: &config.respond_to_allowlist,
+                                    rules: &rules,
+                                    agent_pubkey: &pubkey_hex,
+                                    is_dm,
+                                    rest_client: &ctx.rest_client,
+                                },
+                            ).await
                             else {
                                 continue;
                             };
-                            let Some(ingress) =
-                                AuthorizedNormalListenerEvent(authorized_event)
-                                    .match_subscription(&rules, &pubkey_hex)
-                                    .await
-                            else {
-                                tracing::debug!("authorized event matched no rule — dropping");
-                                continue;
-                            };
-                            let ingress = ingress.resolve_edit_routing(&ctx.rest_client).await;
                             // Derive the session scope once, at admission, from
                             // the operator policy, DM status, and NIP-10 thread
                             // tags. Under the default `channel` policy this is
@@ -7379,6 +7998,8 @@ mod workflow_owner_tests {
 mod author_gate_tests {
     use super::*;
 
+    mod dm_allowlist;
+
     /// A `RestClient` for tests. The author-gate decisions exercised here all
     /// resolve from the owner pubkey or sibling cache before any HTTP call, so
     /// this client is never actually used to make a request.
@@ -7485,7 +8106,7 @@ mod author_gate_tests {
         tokio::task::JoinHandle<()>,
     ) {
         let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
-        let gate = InboundAuthorGate::connect(&rest_client, agent, "test").await;
+        let gate = InboundAuthorGate::connect(&rest_client, agent, "test", false).await;
         (gate, rest_client, server)
     }
 
@@ -7538,7 +8159,8 @@ mod author_gate_tests {
         let relay_hex = relay_keys.public_key().to_hex();
         let agent = nostr::Keys::generate().public_key().to_hex();
         let (rest_client, server) = nip11_scripted_server(responses).await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "listener startup").await;
+        let mut gate =
+            InboundAuthorGate::connect(&rest_client, &agent, "listener startup", false).await;
         let configured_owner = if cache_owner {
             Some(workflow_owner.to_string())
         } else if cache_sibling {
@@ -7678,7 +8300,8 @@ mod author_gate_tests {
 
     /// Both production boundaries must retain DM classification when composing
     /// trusted workflow attribution with configured author policy. External
-    /// allowlist entries and `Anyone` stay denied in a DM; owner and sibling
+    /// allowlist entries are admitted only in verified DMs; `Anyone` stays
+    /// owner/sibling-only. Owner and sibling
     /// principals remain allowed; `Nobody` remains absolute.
     #[tokio::test]
     async fn production_listener_boundaries_enforce_dm_author_policy() {
@@ -7687,7 +8310,7 @@ mod author_gate_tests {
             let relay_hex = relay_keys.public_key().to_hex();
             let external = nostr::Keys::generate().public_key().to_hex();
             let external_allowlist = HashSet::from([external.clone()]);
-            let denied_external = listener_boundary_scenario(ListenerBoundaryScenario {
+            let allowed_external = listener_boundary_scenario(ListenerBoundaryScenario {
                 listener,
                 relay_keys: &relay_keys,
                 workflow_owner: &external,
@@ -7703,8 +8326,8 @@ mod author_gate_tests {
             })
             .await;
             assert!(
-                !denied_external.1,
-                "{} listener must deny an external allowlist entry in a DM",
+                allowed_external.1,
+                "{} listener must admit an explicit allowlist entry in a verified DM",
                 listener.name()
             );
 
@@ -7854,7 +8477,7 @@ mod author_gate_tests {
         let agent = nostr::Keys::generate().public_key().to_hex();
         let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
 
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test", false).await;
         assert!(
             gate.has_relay_identity(),
             "the gate must load the relay signing identity during construction"
@@ -7916,7 +8539,7 @@ mod author_gate_tests {
         // A NIP-11 document with no `self` key: attribution is unavailable.
         let (rest_client, server) = nip11_server(serde_json::json!({ "name": "relay" })).await;
 
-        let gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let gate = InboundAuthorGate::connect(&rest_client, &agent, "test", false).await;
         assert!(
             !gate.has_relay_identity(),
             "a NIP-11 document without `self` must leave attribution unavailable"
@@ -7965,7 +8588,7 @@ mod author_gate_tests {
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
         };
-        let mut gate = InboundAuthorGate::connect(&unreachable, &agent, "test").await;
+        let mut gate = InboundAuthorGate::connect(&unreachable, &agent, "test", false).await;
         assert!(!gate.has_relay_identity());
 
         let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
@@ -8035,7 +8658,7 @@ mod author_gate_tests {
             Ok(serde_json::json!({ "self": relay_hex.clone() })),
         ]))
         .await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup").await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup", false).await;
         assert!(!gate.has_relay_identity());
         let channel_id = Uuid::new_v4();
         let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
@@ -8097,7 +8720,7 @@ mod author_gate_tests {
             }
             responses.push_back(Ok(serde_json::json!({ "self": next_relay_hex.clone() })));
             let (rest_client, server) = nip11_scripted_server(responses).await;
-            let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup").await;
+            let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup", false).await;
             assert_eq!(gate.relay_identity_for_test(), identity.as_deref());
             let channel_id = Uuid::new_v4();
             let channel_info = pool::ChannelInfoResolver::new(
@@ -8173,7 +8796,7 @@ mod author_gate_tests {
             Ok(serde_json::json!({ "self": new_relay_hex.clone() })),
         ]))
         .await;
-        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test", false).await;
         let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
         owner_cache.cache_sibling(old_relay_hex.clone(), false);
         owner_cache.cache_sibling(new_relay_hex.clone(), false);
@@ -8486,15 +9109,15 @@ mod author_gate_tests {
     //
     // In a DM, clients auto-p-tag every participant, and an agent can be
     // asked to open a DM with a third party. The gate must therefore ignore
-    // the allowlist and `anyone` mode inside DMs: only owner + verified
-    // siblings fire turns.
+    // implicit mentions and `anyone` mode inside DMs. Only owner, verified
+    // siblings, or explicitly allowlisted principals in verified DMs fire turns.
 
     #[tokio::test]
-    async fn test_dm_rejects_allowlisted_external_pubkey() {
+    async fn test_dm_admits_allowlisted_external_pubkey() {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
-            !inbound_author_gate::test_author_allowed(
+            inbound_author_gate::test_author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
@@ -8503,7 +9126,7 @@ mod author_gate_tests {
                 &dummy_rest_client()
             )
             .await,
-            "an allowlisted external pubkey must NOT fire a turn inside a DM"
+            "an allowlisted external pubkey may fire a turn inside a verified DM"
         );
     }
 
@@ -9065,23 +9688,37 @@ mod author_gate_tests {
         let id = Uuid::new_v4();
         let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
         let channel_info = resolver(discovered);
-        let owner_cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
-
-        let is_dm = is_dm_channel(id, &channel_info).await;
-        assert!(is_dm, "unknown startup metadata must fail closed as DM");
-        assert!(
-            !inbound_author_gate::test_author_allowed(
+        let sender = nostr::Keys::generate();
+        let author = sender.public_key().to_hex();
+        let owner_cache = OwnerCache::new(None);
+        let allowlist = HashSet::from([author]);
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let relay = nostr::Keys::generate().public_key().to_hex();
+        let (mut gate, rest, server) = connected_gate(&relay, &agent).await;
+        let event = relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id: id,
+            event: nostr::EventBuilder::new(nostr::Kind::TextNote, "hello")
+                .sign_with_keys(&sender)
+                .unwrap(),
+        };
+        assert!(is_dm_channel(id, &channel_info).await);
+        let decision = gate
+            .evaluate_listener_event(
+                &event,
                 &RespondTo::Allowlist,
                 &allowlist,
-                EXTERNAL,
-                is_dm,
                 &owner_cache,
-                &dummy_rest_client(),
+                &channel_info,
+                &rest,
             )
-            .await,
-            "an external author must not pass when startup discovery omitted metadata"
+            .await;
+        assert!(decision.is_dm);
+        assert!(
+            !decision.allowed,
+            "missing metadata must not grant the DM exception"
         );
+        server.abort();
     }
 
     #[tokio::test]
@@ -9556,8 +10193,12 @@ mod build_mcp_servers_tests {
             effort_level: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
+            permission_mode_timeout_secs: 5,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
+            strict_allowlist: false,
+            team_pubkeys: HashSet::new(),
+            team_loop_limit: 6,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,
@@ -10693,8 +11334,12 @@ mod error_outcome_emission_tests {
             effort_level: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
+            permission_mode_timeout_secs: 5,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            strict_allowlist: false,
+            team_pubkeys: HashSet::new(),
+            team_loop_limit: 6,
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
             has_generated_codex_config: false,
